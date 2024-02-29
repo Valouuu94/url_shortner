@@ -1,25 +1,55 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"strings"
 	"time"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-var urls = make(map[string]string)
+var client *mongo.Client
+var urlsCollection *mongo.Collection
+
+type URLDocument struct {
+	ShortKey    string `bson:"short_key"`
+	OriginalURL string `bson:"original_url"`
+}
 
 func main() {
+	initMongoDB()
 	http.HandleFunc("/", handleForm)
 	http.HandleFunc("/shorten", handleShorten)
 	http.HandleFunc("/short/", handleRedirect)
 
 	fmt.Println("URL Shortener is running on :3030")
-	http.ListenAndServe(":3030", nil)
+	if err := http.ListenAndServe(":3030", nil); err != nil {
+		log.Fatal("Failed to start server:", err)
+	}
+}
+
+func initMongoDB() {
+	var err error
+	client, err = mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://localhost:27017"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = client.Ping(context.TODO(), nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	urlsCollection = client.Database("urlshortener").Collection("urls")
+	fmt.Println("Connected to MongoDB")
 }
 
 func handleForm(w http.ResponseWriter, r *http.Request) {
+	log.Println("Serving the form")
 	if r.Method == http.MethodPost {
 		http.Redirect(w, r, "/shorten", http.StatusSeeOther)
 		return
@@ -56,56 +86,39 @@ func handleShorten(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate a unique shortened key for the original URL
 	shortKey := generateShortKey()
-	urls[shortKey] = originalURL
 
-	// Construct the full shortened URL
+	_, err := urlsCollection.InsertOne(context.TODO(), URLDocument{
+		ShortKey:    shortKey,
+		OriginalURL: originalURL,
+	})
+	if err != nil {
+		http.Error(w, "Failed to insert URL into DB", http.StatusInternalServerError)
+		return
+	}
+
 	shortenedURL := fmt.Sprintf("http://localhost:3030/short/%s", shortKey)
-
-	// Serve the result page
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, `
-		<!DOCTYPE html>
-		<html>
-		<head>
-			<title>URL Shortener</title>
-		</head>
-		<body>
-			<h2>URL Shortener</h2>
-			<p>Original URL: `, originalURL, `</p>
-			<p>Shortened URL: <a href="`, shortenedURL, `">`, shortenedURL, `</a></p>
-		</body>
-		</html>
-	`)
+	fmt.Fprintf(w, `<p>Shortened URL: <a href="%s">%s</a></p>`, shortenedURL, shortenedURL)
 }
 
 func handleRedirect(w http.ResponseWriter, r *http.Request) {
 	shortKey := strings.TrimPrefix(r.URL.Path, "/short/")
-	if shortKey == "" {
-		http.Error(w, "Shortened key is missing", http.StatusBadRequest)
-		return
-	}
-
-	// Retrieve the original URL from the `urls` map using the shortened key
-	originalURL, found := urls[shortKey]
-	if !found {
+	var doc URLDocument
+	if err := urlsCollection.FindOne(context.TODO(), bson.M{"short_key": shortKey}).Decode(&doc); err != nil {
 		http.Error(w, "Shortened key not found", http.StatusNotFound)
 		return
 	}
 
-	// Redirect the user to the original URL
-	http.Redirect(w, r, originalURL, http.StatusMovedPermanently)
+	http.Redirect(w, r, doc.OriginalURL, http.StatusMovedPermanently)
 }
 
 func generateShortKey() string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	const keyLength = 6
-
 	rand.Seed(time.Now().UnixNano())
-	shortKey := make([]byte, keyLength)
-	for i := range shortKey {
-		shortKey[i] = charset[rand.Intn(len(charset))]
+	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+	b := make([]rune, 6)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
 	}
-	return string(shortKey)
+	return string(b)
 }
